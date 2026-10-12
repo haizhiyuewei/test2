@@ -1,0 +1,138 @@
+name: Build Tiny10 ARM64 Auto for UTM SE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-tiny10-arm64:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. 自动下载官方 Win10 ARM64 简体中文 ISO
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1" -OutFile "Fido.ps1"
+          Write-Output "正在向微软服务器请求 Win10 ARM64..."
+          # 去掉 -Ed 参数让它自动下载默认版，强制指定 -Arch arm64
+          .\Fido.ps1 -Win 10 -Rel 22H2 -Lang "Chinese (Simplified)" -Arch arm64
+
+      - name: 2. 下载 VirtIO 驱动
+        shell: pwsh
+        run: |
+          Write-Output "下载 VirtIO 驱动..."
+          curl.exe -L -o "virtio-win.iso" "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+
+      - name: 3. 挂载 ISO 并复制文件
+        shell: pwsh
+        run: |
+          $winIso = Get-ChildItem -Path . -Filter "*.iso" | Where-Object { $_.Name -notlike "*virtio*" } | Select-Object -First 1
+          if (-not $winIso) { Write-Error "Fido 未能下载 ISO"; exit 1 }
+          
+          $winMount = Mount-DiskImage -ImagePath $winIso.FullName -PassThru
+          $winDrive = ($winMount | Get-Volume).DriveLetter
+          $virtMount = Mount-DiskImage -ImagePath "$((Get-Item 'virtio-win.iso').FullName)" -PassThru
+          $virtDrive = ($virtMount | Get-Volume).DriveLetter
+
+          New-Item -ItemType Directory -Path "C:\Tiny10-ISO" -Force | Out-Null
+          Copy-Item -Path "${winDrive}:\*" -Destination "C:\Tiny10-ISO" -Recurse -Force
+          
+          Add-Content -Path $env:GITHUB_ENV -Value "VIRTIO_DRIVE=$virtDrive"
+          
+          # 检查是 WIM 还是 ESD
+          if (Test-Path "C:\Tiny10-ISO\sources\install.wim") {
+             Write-Output "发现 install.wim"
+          } elseif (Test-Path "C:\Tiny10-ISO\sources\install.esd") {
+             Write-Error "发现 install.esd (微软可能改用了ESD)。由于无法直接离线挂载ESD，请先手动转换为WIM。"
+             exit 1
+          }
+
+      - name: 4. 暴力精简 Win10 ARM64
+        shell: pwsh
+        run: |
+          $wimPath = "C:\Tiny10-ISO\sources\install.wim"
+          $mountPath = "C:\Mount"
+          
+          attrib -r -s -h $wimPath
+          New-Item -ItemType Directory -Path $mountPath -Force | Out-Null
+          
+          # 尝试挂载索引1
+          Mount-WindowsImage -ImagePath $wimPath -Index 1 -Path $mountPath -Optimize -ErrorAction Stop
+
+          # 移除 Defender 和 WinRE
+          Get-WindowsPackage -Path $mountPath | Where-Object { 
+            $_.PackageName -match "Defender|WinRE" 
+          } | Remove-WindowsPackage -Path $mountPath -ErrorAction SilentlyContinue
+
+          # 逐条移除预装 Appx
+          $appxPackages = Get-AppxProvisionedPackage -Path $mountPath
+          foreach ($pkg in $appxPackages) {
+            try {
+              Remove-AppxProvisionedPackage -Path $mountPath -PackageName $pkg.PackageName -ErrorAction Stop
+            } catch {}
+          }
+
+          # 清理 WinSxS
+          dism.exe /Image:$mountPath /Cleanup-Image /StartComponentCleanup /ResetBase
+
+          Dismount-WindowsImage -Path $mountPath -Save
+
+      - name: 5. 注入 VirtIO ARM64 驱动
+        shell: pwsh
+        run: |
+          $wimPath = "C:\Tiny10-ISO\sources\install.wim"
+          $mountPath = "C:\Mount"
+          $virtDrive = $env:VIRTIO_DRIVE
+
+          Mount-WindowsImage -ImagePath $wimPath -Index 1 -Path $mountPath -Optimize
+
+          # Win10 ARM64 驱动路径
+          $driverBase = "${virtDrive}:\"
+          $driverPaths = @(
+            "${driverBase}\viostor\w10\ARM64",
+            "${driverBase}\vioscsi\w10\ARM64",
+            "${driverBase}\NetKVM\w10\ARM64",
+            "${driverBase}\Balloon\w10\ARM64"
+          )
+
+          foreach ($driverPath in $driverPaths) {
+            if (Test-Path $driverPath) {
+              Write-Output "注入驱动: $driverPath"
+              Add-WindowsDriver -Path $mountPath -Driver $driverPath -Recurse -ErrorAction SilentlyContinue
+            }
+          }
+
+          Dismount-WindowsImage -Path $mountPath -Save
+
+      - name: 6. 终极压缩并打包 ISO
+        shell: pwsh
+        run: |
+          $wimPath = "C:\Tiny10-ISO\sources\install.wim"
+          $newWimPath = "C:\Tiny10-ISO\sources\install_new.wim"
+          Export-WindowsImage -SourceImagePath $wimPath -SourceIndex 1 -DestinationImagePath $newWimPath -CompressionType Maximum
+          Move-Item -Path $newWimPath -Destination $wimPath -Force
+
+          $oscdimg = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits" -Filter "oscdimg.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $oscdimg) {
+            Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2289980" -OutFile "adksetup.exe"
+            Start-Process -FilePath "adksetup.exe" -ArgumentList "/quiet /features OptionId.DeploymentTools" -Wait
+            $oscdimg = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits" -Filter "oscdimg.exe" -Recurse | Select-Object -First 1
+          }
+
+          & $oscdimg.FullName --% -m -o -u2 -udfver102 -bootdata:2#p0,e,b"C:\Tiny10-ISO\boot\etfsboot.com"#pEF,e,b"C:\Tiny10-ISO\efi\microsoft\boot\efisys.bin" -l"Tiny10_ARM64" "C:\Tiny10-ISO" "C:\Tiny10_ARM64.iso"
+
+      - name: 7. 分卷压缩防超限
+        shell: pwsh
+        run: |
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $sevenZip)) { $sevenZip = "${env:ProgramFiles}\7-Zip\7z.exe" }
+          & $sevenZip a -v1900m "C:\Tiny10_ARM64.7z" "C:\Tiny10_ARM64.iso"
+
+      - name: 8. 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tiny10-ARM64-UTM
+          path: |
+            C:\Tiny10_ARM64.iso
+            C:\Tiny10_ARM64.7z.*
+          retention-days: 7
